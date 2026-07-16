@@ -41,11 +41,14 @@ use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     future::Future,
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, instrument};
 
 // Data usage storage constants
@@ -55,7 +58,26 @@ const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
+/// Lifetime of a completed live recount. Deliberately not `DATA_USAGE_CACHE_TTL_SECS`:
+/// a full `list_object_versions` walk of a large bucket costs minutes, so a 30s
+/// entry would expire long before the next walk could replace it and every admin
+/// poll would miss. Staleness stays bounded without a short TTL — local writes
+/// invalidate via `invalidate_live_bucket_usage_cache`, and callers apply the
+/// dirty memory overlay after the live entry, so only other nodes' writes can age
+/// this value. That is still fresher than the scanner snapshot a miss falls back to.
+const LIVE_BUCKET_USAGE_TTL_SECS: u64 = 300;
 const LIVE_BUCKET_USAGE_MAX_ENTRIES: u64 = 1024;
+/// Serialize background live bucket listings so cold multi-bucket admin polls
+/// do not fan out concurrent full `list_object_versions` walks.
+const LIVE_USAGE_REFRESH_PERMITS: usize = 1;
+/// Hard outer bound for one background live recount *after* the semaphore permit
+/// is acquired. Permit wait is intentionally uncapped so a deep refresh queue
+/// does not time out before it starts; the timeout only fences wedged listings
+/// that would otherwise pin the process-wide permit forever.
+const LIVE_USAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bound coalesce retries when an in-flight leader is superseded mid-refresh so
+/// newer-epoch waiters are not poisoned by moka sharing one failed `try_get_with`.
+const LIVE_USAGE_COALESCE_MAX_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone)]
 struct CachedBucketUsage {
@@ -70,11 +92,60 @@ struct CachedBucketUsage {
 
 type UsageMemoryCache = Arc<RwLock<HashMap<String, CachedBucketUsage>>>;
 type CacheUpdating = Arc<RwLock<bool>>;
-type LiveBucketUsageCache = moka::future::Cache<String, BucketUsageInfo>;
+
+#[derive(Debug, Clone)]
+struct LiveBucketUsageEntry {
+    usage: BucketUsageInfo,
+    /// Generation at the time this entry was computed. Bumped on invalidate so
+    /// an in-flight refresh that finishes after a write cannot poison the TTL cache.
+    epoch: u64,
+}
+
+type LiveBucketUsageCache = moka::future::Cache<String, LiveBucketUsageEntry>;
+type LiveBucketUsageEpochs = Arc<RwLock<HashMap<String, u64>>>;
+/// Bucket -> unique owner id captured at insert; end-of-task remove only when still owner.
+type LiveBucketUsageInFlight = Arc<RwLock<HashMap<String, u64>>>;
 
 static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
 static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
 static LIVE_BUCKET_USAGE_CACHE: OnceLock<LiveBucketUsageCache> = OnceLock::new();
+static LIVE_BUCKET_USAGE_EPOCHS: OnceLock<LiveBucketUsageEpochs> = OnceLock::new();
+static LIVE_BUCKET_USAGE_IN_FLIGHT: OnceLock<LiveBucketUsageInFlight> = OnceLock::new();
+static LIVE_BUCKET_USAGE_NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static LIVE_USAGE_REFRESH_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(LIVE_USAGE_REFRESH_PERMITS));
+
+#[cfg(test)]
+static LIVE_APPLY_HIT_TEST_HOOK: std::sync::Mutex<Option<Arc<LiveApplyHitTestHook>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK: std::sync::Mutex<Option<Arc<LiveSchedulePreEnsureTestHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static LIVE_DISCARD_TEST_HOOK: std::sync::Mutex<Option<Arc<LiveDiscardTestHook>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct LiveApplyHitTestHook {
+    /// Signalled once the apply path has a validated live hit and is about to pause.
+    entered: tokio::sync::Notify,
+    /// Test releases this to let apply continue after an intentional invalidate.
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct LiveSchedulePreEnsureTestHook {
+    /// Signalled once schedule's first still-owned check has passed and is about to
+    /// pause before ensure/coalesce (exposes the still_owned -> ensure -> still_owned TOCTOU).
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct LiveDiscardTestHook {
+    /// Signalled once discard removed the TTL entry and is about to decide re-insert.
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
 
 /// Deferred persist thresholds for compression totals: persist after this many
 /// operations recorded, but no more often than the min interval.
@@ -119,8 +190,112 @@ fn live_bucket_usage_cache() -> &'static LiveBucketUsageCache {
     LIVE_BUCKET_USAGE_CACHE.get_or_init(|| {
         moka::future::Cache::builder()
             .max_capacity(LIVE_BUCKET_USAGE_MAX_ENTRIES)
+            .time_to_live(Duration::from_secs(LIVE_BUCKET_USAGE_TTL_SECS))
             .build()
     })
+}
+
+fn live_bucket_usage_epochs() -> &'static LiveBucketUsageEpochs {
+    LIVE_BUCKET_USAGE_EPOCHS.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+fn live_bucket_usage_in_flight() -> &'static LiveBucketUsageInFlight {
+    LIVE_BUCKET_USAGE_IN_FLIGHT.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+fn next_live_bucket_usage_owner_id() -> u64 {
+    LIVE_BUCKET_USAGE_NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// True when this task still owns the in-flight slot and forget has not cleared it.
+async fn live_bucket_usage_schedule_still_owned(bucket: &str, owner_id: u64) -> bool {
+    live_bucket_usage_in_flight().read().await.get(bucket) == Some(&owner_id)
+}
+
+async fn release_live_bucket_usage_in_flight_if_owner(bucket: &str, owner_id: u64) {
+    let mut inflight = live_bucket_usage_in_flight().write().await;
+    if inflight.get(bucket) == Some(&owner_id) {
+        inflight.remove(bucket);
+    }
+}
+
+/// Current epoch when the bucket is still tracked. `None` means the bucket was
+/// forgotten (deleted) so in-flight publishes must not revive a TTL entry.
+async fn live_bucket_usage_epoch_if_tracked(bucket: &str) -> Option<u64> {
+    live_bucket_usage_epochs().read().await.get(bucket).copied()
+}
+
+async fn live_bucket_usage_epoch(bucket: &str) -> u64 {
+    live_bucket_usage_epoch_if_tracked(bucket).await.unwrap_or(0)
+}
+
+async fn ensure_live_bucket_usage_epoch(bucket: &str) -> u64 {
+    let mut epochs = live_bucket_usage_epochs().write().await;
+    *epochs.entry(bucket.to_string()).or_insert(0)
+}
+
+async fn bump_live_bucket_usage_epoch(bucket: &str) -> u64 {
+    let mut epochs = live_bucket_usage_epochs().write().await;
+    let entry = epochs.entry(bucket.to_string()).or_insert(0);
+    *entry = entry.wrapping_add(1);
+    *entry
+}
+
+async fn invalidate_live_bucket_usage_cache(bucket: &str) {
+    bump_live_bucket_usage_epoch(bucket).await;
+    live_bucket_usage_cache().invalidate(bucket).await;
+}
+
+/// Fence in-flight refreshes and drop epoch tracking for a deleted bucket so
+/// create/delete churn cannot grow the epoch map without bound.
+async fn forget_live_bucket_usage(bucket: &str) {
+    bump_live_bucket_usage_epoch(bucket).await;
+    live_bucket_usage_cache().invalidate(bucket).await;
+    live_bucket_usage_epochs().write().await.remove(bucket);
+    // Drop in-flight ownership so a same-name recreate can schedule; fenced owners
+    // observe the cleared in-flight slot and exit without ensure/publish.
+    live_bucket_usage_in_flight().write().await.remove(bucket);
+}
+
+/// Drop a superseded TTL entry only when it still matches `superseded_epoch`.
+/// `remove` + conditional re-insert avoids wiping a newer winner published after
+/// a plain get-then-invalidate race.
+async fn discard_superseded_live_cache_entry(bucket: &str, superseded_epoch: u64) {
+    let Some(cached) = live_bucket_usage_cache().remove(bucket).await else {
+        return;
+    };
+    #[cfg(test)]
+    {
+        let hook = LIVE_DISCARD_TEST_HOOK.lock().expect("live discard hook lock").clone();
+        if let Some(hook) = hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+    }
+    if cached.epoch == superseded_epoch {
+        return;
+    }
+    // Restored only while that newer generation is still the tracked epoch.
+    if live_bucket_usage_epoch_if_tracked(bucket).await == Some(cached.epoch) {
+        live_bucket_usage_cache().insert(bucket.to_string(), cached).await;
+    }
+}
+
+async fn current_live_bucket_usage_entry(bucket: &str) -> Option<LiveBucketUsageEntry> {
+    let entry = live_bucket_usage_cache().get(bucket).await?;
+    let current = live_bucket_usage_epoch_if_tracked(bucket).await?;
+    if entry.epoch != current {
+        return None;
+    }
+    // Re-check after the cache read so a concurrent invalidate/delete loses the race cleanly.
+    if live_bucket_usage_epoch_if_tracked(bucket).await != Some(current) {
+        return None;
+    }
+    Some(entry)
+}
+
+async fn cached_live_bucket_usage_if_current(bucket: &str) -> Option<BucketUsageInfo> {
+    current_live_bucket_usage_entry(bucket).await.map(|entry| entry.usage)
 }
 
 // Data usage storage paths
@@ -221,7 +396,7 @@ async fn clear_bucket_usage_memory(bucket: &str) {
 }
 
 pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
-    live_bucket_usage_cache().invalidate(bucket).await;
+    forget_live_bucket_usage(bucket).await;
     clear_bucket_usage_memory(bucket).await;
 
     let data_usage_info = load_data_usage_from_backend(store.clone()).await?;
@@ -639,20 +814,243 @@ fn advance_version_listing_cursor(
     Ok(())
 }
 
-async fn coalesce_live_bucket_usage<F>(bucket: String, init: F) -> Result<BucketUsageInfo, Error>
+/// Why a coalesced live refresh did not publish. `Superseded` drives the retry
+/// decision, so it must stay a distinct variant rather than an error-text match:
+/// routing control flow on message prose breaks the moment a message is reworded.
+#[derive(Debug)]
+enum LiveRefreshError {
+    /// A write/delete bumped the epoch (or forgot the bucket) mid-refresh.
+    Superseded,
+    /// The underlying object-layer listing itself failed.
+    Failed(Error),
+}
+
+impl std::fmt::Display for LiveRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveRefreshError::Superseded => write!(f, "live usage refresh was superseded"),
+            LiveRefreshError::Failed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+async fn coalesce_live_bucket_usage<F, Fut>(bucket: String, make_init: F) -> Result<BucketUsageInfo, Error>
 where
-    F: Future<Output = Result<BucketUsageInfo, Error>> + Send + 'static,
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = Result<BucketUsageInfo, Error>> + Send + 'static,
 {
-    let result = live_bucket_usage_cache().try_get_with(bucket.clone(), init).await;
-    live_bucket_usage_cache().invalidate(&bucket).await;
-    result.map_err(|err| Error::other(err.to_string()))
+    for _attempt in 0..LIVE_USAGE_COALESCE_MAX_ATTEMPTS {
+        if let Some(entry) = current_live_bucket_usage_entry(&bucket).await {
+            return Ok(entry.usage);
+        }
+
+        // Callers that need first-seen tracking must ensure before coalesce; an
+        // untracked bucket here means forget fenced the refresh — never resurrect.
+        let Some(epoch) = live_bucket_usage_epoch_if_tracked(&bucket).await else {
+            return Err(Error::other(format!("live usage for {bucket} was superseded")));
+        };
+        let init_bucket = bucket.clone();
+        let init_fut = make_init();
+        let result = live_bucket_usage_cache()
+            .try_get_with(bucket.clone(), async move {
+                let usage = init_fut.await.map_err(LiveRefreshError::Failed)?;
+                // A write/delete may have invalidated or forgotten us while listing.
+                let Some(current) = live_bucket_usage_epoch_if_tracked(&init_bucket).await else {
+                    return Err(LiveRefreshError::Superseded);
+                };
+                if current != epoch {
+                    return Err(LiveRefreshError::Superseded);
+                }
+                Ok(LiveBucketUsageEntry { usage, epoch })
+            })
+            .await;
+
+        match result {
+            Ok(entry) => {
+                if live_bucket_usage_epoch_if_tracked(&bucket).await != Some(entry.epoch) {
+                    discard_superseded_live_cache_entry(&bucket, entry.epoch).await;
+                    continue;
+                }
+                return Ok(entry.usage);
+            }
+            Err(err) => match &*err {
+                LiveRefreshError::Superseded => {
+                    // Retry only while the bucket is still tracked (invalidate). After
+                    // forget(), the epoch key is gone — do not resurrect it via ensure.
+                    if live_bucket_usage_epoch_if_tracked(&bucket).await.is_none() {
+                        return Err(Error::other(format!("live usage for {bucket} was superseded")));
+                    }
+                    continue;
+                }
+                LiveRefreshError::Failed(inner) => return Err(Error::other(inner.to_string())),
+            },
+        }
+    }
+    Err(Error::other(format!("live usage for {bucket} was superseded")))
 }
 
 fn apply_live_bucket_usage_to_response(data_usage_info: &mut DataUsageInfo, bucket: &str, usage: &BucketUsageInfo) {
     data_usage_info.bucket_sizes.insert(bucket.to_string(), usage.size);
     data_usage_info.buckets_usage.insert(bucket.to_string(), usage.clone());
     set_buckets_count_from_usage(data_usage_info);
-    data_usage_info.calculate_totals();
+}
+
+async fn run_live_usage_refresh_under_permit_with_timeout<F>(timeout: Duration, init: F) -> Result<BucketUsageInfo, Error>
+where
+    F: Future<Output = Result<BucketUsageInfo, Error>> + Send,
+{
+    let _permit = LIVE_USAGE_REFRESH_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|_| Error::other("live usage refresh semaphore closed"))?;
+    tokio::time::timeout(timeout, init)
+        .await
+        .map_err(|_| Error::other("live usage refresh timed out"))?
+}
+
+async fn run_live_usage_refresh_under_permit<F>(init: F) -> Result<BucketUsageInfo, Error>
+where
+    F: Future<Output = Result<BucketUsageInfo, Error>> + Send,
+{
+    run_live_usage_refresh_under_permit_with_timeout(LIVE_USAGE_REFRESH_TIMEOUT, init).await
+}
+
+fn schedule_live_bucket_usage_refresh<F, Fut>(bucket: &str, make_init: F)
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<BucketUsageInfo, Error>> + Send + 'static,
+{
+    let bucket_name = bucket.to_string();
+    tokio::spawn(async move {
+        let owner_id = next_live_bucket_usage_owner_id();
+        {
+            let mut inflight = live_bucket_usage_in_flight().write().await;
+            if inflight.insert(bucket_name.clone(), owner_id).is_some() {
+                // Another AccountInfo/DataUsageInfo poll already scheduled this bucket.
+                return;
+            }
+        }
+
+        if !live_bucket_usage_schedule_still_owned(&bucket_name, owner_id).await {
+            release_live_bucket_usage_in_flight_if_owner(&bucket_name, owner_id).await;
+            return;
+        }
+
+        #[cfg(test)]
+        {
+            let hook = LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK
+                .lock()
+                .expect("live schedule pre-ensure hook lock")
+                .clone();
+            if let Some(hook) = hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+        }
+
+        if live_bucket_usage_epoch_if_tracked(&bucket_name).await.is_none() {
+            ensure_live_bucket_usage_epoch(&bucket_name).await;
+        }
+
+        if !live_bucket_usage_schedule_still_owned(&bucket_name, owner_id).await {
+            // forget() may have cleared in-flight after ensure resurrected the epoch above (TOCTOU
+            // between the still-owned check and ensure). Undo the resurrection only when no
+            // newer owner has claimed in-flight, otherwise we would wipe the recreate's tracking.
+            if live_bucket_usage_in_flight().read().await.get(&bucket_name).is_none() {
+                live_bucket_usage_epochs().write().await.remove(&bucket_name);
+            }
+            release_live_bucket_usage_in_flight_if_owner(&bucket_name, owner_id).await;
+            return;
+        }
+
+        let result = coalesce_live_bucket_usage(bucket_name.clone(), || {
+            let init = make_init();
+            async move { run_live_usage_refresh_under_permit(init).await }
+        })
+        .await;
+
+        release_live_bucket_usage_in_flight_if_owner(&bucket_name, owner_id).await;
+
+        if let Err(err) = result {
+            debug!(
+                bucket = %bucket_name,
+                error = %err,
+                "background live bucket usage refresh failed"
+            );
+        }
+    });
+}
+
+async fn apply_cached_live_bucket_usage_or_schedule_refresh<F, Fut>(
+    data_usage_info: &mut DataUsageInfo,
+    bucket: &str,
+    make_init: F,
+) where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<BucketUsageInfo, Error>> + Send + 'static,
+{
+    if let Some(entry) = current_live_bucket_usage_entry(bucket).await {
+        let entry_epoch = entry.epoch;
+
+        #[cfg(test)]
+        {
+            let hook = LIVE_APPLY_HIT_TEST_HOOK.lock().expect("live apply hit hook lock").clone();
+            if let Some(hook) = hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
+            }
+        }
+
+        let prior_usage = data_usage_info.buckets_usage.get(bucket).cloned();
+        let prior_size = data_usage_info.bucket_sizes.get(bucket).copied();
+        apply_live_bucket_usage_to_response(data_usage_info, bucket, &entry.usage);
+        // Delete/invalidate may have raced after the cache read; restore scanner/overlay
+        // state. Compare against the entry's epoch (not a post-read resample of "current"),
+        // otherwise an invalidate between get and resample is invisible.
+        if live_bucket_usage_epoch_if_tracked(bucket).await != Some(entry_epoch) {
+            match prior_usage {
+                Some(usage) => {
+                    data_usage_info.buckets_usage.insert(bucket.to_string(), usage);
+                }
+                None => {
+                    data_usage_info.buckets_usage.remove(bucket);
+                }
+            }
+            match prior_size {
+                Some(size) => {
+                    data_usage_info.bucket_sizes.insert(bucket.to_string(), size);
+                }
+                None => {
+                    data_usage_info.bucket_sizes.remove(bucket);
+                }
+            }
+            set_buckets_count_from_usage(data_usage_info);
+            data_usage_info.calculate_totals();
+            // Invalidate still tracks the bucket; forget leaves epoch untracked and must
+            // not schedule a refresh that would resurrect TTL state for a deleted bucket.
+            if live_bucket_usage_epoch_if_tracked(bucket).await.is_some() {
+                schedule_live_bucket_usage_refresh(bucket, make_init);
+            }
+        }
+        return;
+    }
+    schedule_live_bucket_usage_refresh(bucket, make_init);
+}
+
+/// Apply any TTL-cached live bucket usage into the response and schedule a
+/// background object-layer recount on cache miss.
+///
+/// Admin handlers must not await a full `list_object_versions` walk on the
+/// request path (rustfs/rustfs#4902). Completed live results stay response-local
+/// and are not promoted into the quota memory cache.
+pub async fn apply_cached_or_schedule_live_bucket_usage(store: Arc<ECStore>, data_usage_info: &mut DataUsageInfo, bucket: &str) {
+    let bucket_name = bucket.to_string();
+    apply_cached_live_bucket_usage_or_schedule_refresh(data_usage_info, bucket, move || {
+        let store = store.clone();
+        let bucket_name = bucket_name.clone();
+        async move { compute_bucket_usage(store, &bucket_name).await }
+    })
+    .await;
 }
 
 pub async fn refresh_bucket_usage_from_object_layer(
@@ -661,11 +1059,20 @@ pub async fn refresh_bucket_usage_from_object_layer(
     bucket: &str,
 ) -> Result<BucketUsageInfo, Error> {
     let bucket_name = bucket.to_string();
-    let usage =
-        coalesce_live_bucket_usage(bucket_name.clone(), async move { compute_bucket_usage(store, &bucket_name).await }).await?;
+    ensure_live_bucket_usage_epoch(&bucket_name).await;
+    let usage = coalesce_live_bucket_usage(bucket_name.clone(), {
+        let store = store.clone();
+        move || {
+            let store = store.clone();
+            let bucket_name = bucket_name.clone();
+            async move { compute_bucket_usage(store, &bucket_name).await }
+        }
+    })
+    .await?;
     // Request-time listings are not linearizable with writes on other nodes.
     // Keep the live result response-local instead of promoting it into the quota cache.
     apply_live_bucket_usage_to_response(data_usage_info, bucket, &usage);
+    data_usage_info.calculate_totals();
     Ok(usage)
 }
 
@@ -806,6 +1213,8 @@ async fn record_bucket_object_write_memory_inner(
     entry.usage_updated_at = now;
     entry.dirty = true;
     entry.stale_snapshot_pending = false;
+    drop(cache);
+    invalidate_live_bucket_usage_cache(bucket).await;
 }
 
 /// Degraded in-memory update for an object write whose previous current size
@@ -834,6 +1243,8 @@ pub async fn record_bucket_object_write_unknown_previous_memory(bucket: &str, ne
     entry.usage_updated_at = now;
     entry.dirty = true;
     entry.stale_snapshot_pending = false;
+    drop(cache);
+    invalidate_live_bucket_usage_cache(bucket).await;
 }
 
 /// Fast in-memory increment for immediate quota consistency.
@@ -861,6 +1272,8 @@ pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64,
     entry.usage_updated_at = now;
     entry.dirty = true;
     entry.stale_snapshot_pending = false;
+    drop(cache);
+    invalidate_live_bucket_usage_cache(bucket).await;
 }
 
 /// Fast in-memory update for successful delete marker creation.
@@ -879,6 +1292,8 @@ pub async fn record_bucket_delete_marker_memory(bucket: &str) {
     entry.usage_updated_at = now;
     entry.dirty = true;
     entry.stale_snapshot_pending = false;
+    drop(cache);
+    invalidate_live_bucket_usage_cache(bucket).await;
 }
 
 /// Fast in-memory decrement for immediate quota consistency
@@ -1443,22 +1858,25 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn live_bucket_usage_refreshes_are_coalesced_only_while_in_flight() {
+    async fn live_bucket_usage_refreshes_are_coalesced_and_cached_until_invalidated() {
         const BUCKET: &str = "coalesced-live-usage-test";
-        live_bucket_usage_cache().invalidate(BUCKET).await;
+        invalidate_live_bucket_usage_cache(BUCKET).await;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut tasks = Vec::new();
 
         for _ in 0..8 {
             let calls = Arc::clone(&calls);
-            tasks.push(tokio::spawn(coalesce_live_bucket_usage(BUCKET.to_string(), async move {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                Ok(BucketUsageInfo {
-                    objects_count: 7,
-                    size: 42,
-                    ..Default::default()
-                })
+            tasks.push(tokio::spawn(coalesce_live_bucket_usage(BUCKET.to_string(), move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok(BucketUsageInfo {
+                        objects_count: 7,
+                        size: 42,
+                        ..Default::default()
+                    })
+                }
             })));
         }
 
@@ -1471,15 +1889,1119 @@ mod tests {
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        let calls_after_batch = Arc::clone(&calls);
-        coalesce_live_bucket_usage(BUCKET.to_string(), async move {
-            calls_after_batch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let calls_within_ttl = Arc::clone(&calls);
+        let cached = coalesce_live_bucket_usage(BUCKET.to_string(), move || {
+            let calls_within_ttl = Arc::clone(&calls_within_ttl);
+            async move {
+                calls_within_ttl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BucketUsageInfo::default())
+            }
+        })
+        .await
+        .expect("a later refresh within TTL should reuse the cached live result");
+        assert_eq!((cached.objects_count, cached.size), (7, 42));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        let calls_after_invalidate = Arc::clone(&calls);
+        coalesce_live_bucket_usage(BUCKET.to_string(), move || {
+            let calls_after_invalidate = Arc::clone(&calls_after_invalidate);
+            async move {
+                calls_after_invalidate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BucketUsageInfo {
+                    objects_count: 1,
+                    size: 2,
+                    ..Default::default()
+                })
+            }
+        })
+        .await
+        .expect("a refresh after invalidate should recompute");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn apply_cached_or_schedule_returns_immediately_on_cache_miss() {
+        const BUCKET: &str = "live-schedule-miss-test";
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+
+        let mut response = DataUsageInfo::default();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, || async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(BucketUsageInfo {
+                objects_count: 9,
+                size: 99,
+                ..Default::default()
+            })
+        })
+        .await;
+
+        assert!(
+            !response.buckets_usage.contains_key(BUCKET),
+            "cache miss must not block the response on the live recount"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cached_live_bucket_usage_if_current(BUCKET).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background live refresh should populate the TTL cache");
+
+        let mut next_response = DataUsageInfo::default();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut next_response, BUCKET, || async move {
+            panic!("cache hit must not schedule another live recount");
+        })
+        .await;
+        assert_eq!(
+            next_response
+                .buckets_usage
+                .get(BUCKET)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((9, 99))
+        );
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn write_memory_invalidates_live_bucket_usage_cache() {
+        const BUCKET: &str = "live-invalidate-on-write-test";
+        clear_usage_memory_cache_for_test().await;
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 3,
+                size: 30,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("seed live cache");
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_some());
+
+        let persisted = data_usage_info_for_test(BUCKET, 3, 30, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_write_memory(BUCKET, None, 5).await;
+
+        assert!(
+            cached_live_bucket_usage_if_current(BUCKET).await.is_none(),
+            "write-path memory updates must drop sticky live usage so dirty overlay can win"
+        );
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        clear_usage_memory_cache_for_test().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invalidate_during_in_flight_refresh_does_not_poison_ttl_cache() {
+        const BUCKET: &str = "live-invalidate-inflight-test";
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut response = DataUsageInfo::default();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, {
+            let release = Arc::clone(&release);
+            let entered = Arc::clone(&entered);
+            let finished = Arc::clone(&finished);
+            let calls = Arc::clone(&calls);
+            move || {
+                let release = Arc::clone(&release);
+                let entered = Arc::clone(&entered);
+                let finished = Arc::clone(&finished);
+                let calls = Arc::clone(&calls);
+                async move {
+                    let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                        release.notified().await;
+                        finished.notify_waiters();
+                        Ok(BucketUsageInfo {
+                            objects_count: 1,
+                            size: 10,
+                            ..Default::default()
+                        })
+                    } else {
+                        // Stop the post-supersede retry so this test only asserts the
+                        // superseded snapshot is not published.
+                        Err(Error::other("stop retry after superseded refresh"))
+                    }
+                }
+            }
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("background refresh must enter init before invalidate");
+
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), finished.notified())
+            .await
+            .expect("superseded refresh must finish init");
+        // Init finished; coalesce must refuse to publish. Poll so we do not rely on a fixed sleep.
+        for _ in 0..30 {
+            assert!(
+                cached_live_bucket_usage_if_current(BUCKET).await.is_none(),
+                "a refresh that finished after invalidate must not become a usable TTL hit"
+            );
+            assert!(
+                live_bucket_usage_cache().get(BUCKET).await.is_none(),
+                "superseded init must not leave a stale epoch entry in the TTL cache"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut next_response = data_usage_info_for_test(BUCKET, 5, 50, SystemTime::now());
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut next_response, BUCKET, || async move {
+            Err(Error::other("background refresh must not be required for this assertion"))
+        })
+        .await;
+        assert_eq!(
+            next_response
+                .buckets_usage
+                .get(BUCKET)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((5, 50)),
+            "admin response must keep scanner/overlay counts when live cache is superseded"
+        );
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn coalesce_retries_after_invalidate_and_publishes_fresh_epoch() {
+        const BUCKET: &str = "live-coalesce-superseded-retry-test";
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = tokio::spawn(coalesce_live_bucket_usage(BUCKET.to_string(), {
+            let release = Arc::clone(&release);
+            let entered = Arc::clone(&entered);
+            let calls = Arc::clone(&calls);
+            move || {
+                let release = Arc::clone(&release);
+                let entered = Arc::clone(&entered);
+                let calls = Arc::clone(&calls);
+                async move {
+                    let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                        release.notified().await;
+                        Ok(BucketUsageInfo {
+                            objects_count: 1,
+                            size: 10,
+                            ..Default::default()
+                        })
+                    } else {
+                        Ok(BucketUsageInfo {
+                            objects_count: 2,
+                            size: 20,
+                            ..Default::default()
+                        })
+                    }
+                }
+            }
+        }));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("coalesce init must start (epoch already captured) before invalidate");
+
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        release.notify_one();
+
+        let usage = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("coalesce must finish after release")
+            .expect("coalesce task should not panic")
+            .expect("coalesce must retry after supersede and publish the fresh epoch");
+        assert_eq!((usage.objects_count, usage.size), (2, 20));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            cached_live_bucket_usage_if_current(BUCKET)
+                .await
+                .map(|u| (u.objects_count, u.size)),
+            Some((2, 20))
+        );
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn coalesce_after_forget_without_ensure_does_not_resurrect_epoch() {
+        const BUCKET: &str = "live-coalesce-forget-no-ensure-test";
+        forget_live_bucket_usage(BUCKET).await;
+
+        let init_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Calls coalesce directly (no ensure beforehand), covering the attempt-0 path where
+        // a `None if attempt == 0 => ensure(...)` regression would resurrect epoch tracking
+        // for a bucket that forget() just fenced.
+        let result = coalesce_live_bucket_usage(BUCKET.to_string(), {
+            let init_calls = Arc::clone(&init_calls);
+            move || {
+                let init_calls = Arc::clone(&init_calls);
+                async move {
+                    init_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(BucketUsageInfo {
+                        objects_count: 1,
+                        size: 10,
+                        ..Default::default()
+                    })
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "coalesce must fail for a forgotten bucket when nobody ensured its epoch first"
+        );
+        assert_eq!(
+            init_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "init must never run for an untracked/forgotten bucket"
+        );
+        assert!(
+            live_bucket_usage_epoch_if_tracked(BUCKET).await.is_none(),
+            "epoch must remain untracked; resurrecting it here would leak an unbounded map entry"
+        );
+        assert!(
+            cached_live_bucket_usage_if_current(BUCKET).await.is_none(),
+            "no usable TTL entry must exist for a forgotten bucket"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn discard_superseded_live_cache_entry_does_not_wipe_newer_epoch() {
+        const BUCKET: &str = "live-discard-cas-test";
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 2,
+                size: 20,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("seed live cache at current epoch");
+        let winner_epoch = live_bucket_usage_epoch(BUCKET).await;
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_some());
+
+        // Simulate a superseded loser's trailing cleanup for an older epoch.
+        discard_superseded_live_cache_entry(BUCKET, winner_epoch.wrapping_sub(1)).await;
+
+        let still_cached = cached_live_bucket_usage_if_current(BUCKET)
+            .await
+            .expect("newer winner must survive discard of an older superseded epoch");
+        assert_eq!((still_cached.objects_count, still_cached.size), (2, 20));
+
+        discard_superseded_live_cache_entry(BUCKET, winner_epoch).await;
+        assert!(
+            cached_live_bucket_usage_if_current(BUCKET).await.is_none(),
+            "discard matching the cached epoch must drop the entry"
+        );
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dirty_memory_overlay_wins_over_cached_live_hit() {
+        const BUCKET: &str = "live-dirty-overlay-wins-test";
+        clear_usage_memory_cache_for_test().await;
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 1,
+                size: 10,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("seed live TTL cache");
+
+        // Seed scanner baseline then a dirty write-path increment without clearing live
+        // via a second invalidate race: write invalidates live, so re-seed live after
+        // recording dirty memory by inserting through coalesce at the new epoch.
+        let persisted = data_usage_info_for_test(BUCKET, 1, 10, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_write_memory(BUCKET, None, 5).await;
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_none());
+
+        // Re-publish a stale-shaped live snapshot at the post-write epoch (simulates a
+        // TTL hit that is older than dirty memory counts).
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 1,
+                size: 10,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("re-seed live cache after write invalidate");
+
+        // Mirror AccountInfo: response last_update is the scanner snapshot time, not "now".
+        // Overlay compares dirty usage_updated_at against that timestamp.
+        let mut response = persisted.clone();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, || async {
+            panic!("must use cached live hit");
+        })
+        .await;
+        assert_eq!(
+            response
+                .buckets_usage
+                .get(BUCKET)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((1, 10)),
+            "live hit applied before overlay"
+        );
+
+        // Same ordering as AccountInfo / DataUsageInfo admin paths.
+        apply_bucket_usage_memory_overlay(&mut response).await;
+        assert_eq!(
+            response
+                .buckets_usage
+                .get(BUCKET)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((2, 15)),
+            "dirty write-path overlay must win over TTL live snapshot"
+        );
+
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        clear_usage_memory_cache_for_test().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn background_live_usage_refreshes_are_serialized_by_semaphore() {
+        const BUCKET_A: &str = "live-sem-a-test";
+        const BUCKET_B: &str = "live-sem-b-test";
+        invalidate_live_bucket_usage_cache(BUCKET_A).await;
+        invalidate_live_bucket_usage_cache(BUCKET_B).await;
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let spawn_blocked = |bucket: &'static str| {
+            let release = Arc::clone(&release);
+            let concurrent = Arc::clone(&concurrent);
+            let max_concurrent = Arc::clone(&max_concurrent);
+            let mut response = DataUsageInfo::default();
+            async move {
+                apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, bucket, move || {
+                    let release = Arc::clone(&release);
+                    let concurrent = Arc::clone(&concurrent);
+                    let max_concurrent = Arc::clone(&max_concurrent);
+                    async move {
+                        let now = concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max_concurrent.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        release.notified().await;
+                        concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(BucketUsageInfo {
+                            objects_count: 1,
+                            size: 1,
+                            ..Default::default()
+                        })
+                    }
+                })
+                .await;
+            }
+        };
+
+        spawn_blocked(BUCKET_A).await;
+        spawn_blocked(BUCKET_B).await;
+
+        // Wait until the first refresh is inside the critical section.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if max_concurrent.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first refresh should acquire the permit");
+
+        // While the first holder is blocked, concurrency must stay at 1.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            max_concurrent.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "LIVE_USAGE_REFRESH_PERMITS=1 must serialize background listings"
+        );
+
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // First waiter may consume the first notify; keep waking until both finish.
+                release.notify_waiters();
+                if cached_live_bucket_usage_if_current(BUCKET_A).await.is_some()
+                    && cached_live_bucket_usage_if_current(BUCKET_B).await.is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both serialized refreshes should complete");
+
+        assert_eq!(max_concurrent.load(std::sync::atomic::Ordering::SeqCst), 1);
+        invalidate_live_bucket_usage_cache(BUCKET_A).await;
+        invalidate_live_bucket_usage_cache(BUCKET_B).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn live_usage_refresh_timeout_releases_semaphore_permit() {
+        let err = run_live_usage_refresh_under_permit_with_timeout(Duration::from_millis(30), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
             Ok(BucketUsageInfo::default())
         })
         .await
-        .expect("a later refresh should run after the in-flight entry is removed");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        live_bucket_usage_cache().invalidate(BUCKET).await;
+        .expect_err("refresh must time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "timeout error should be distinguishable, got: {err}"
+        );
+
+        let _permit = tokio::time::timeout(Duration::from_millis(200), LIVE_USAGE_REFRESH_SEMAPHORE.acquire())
+            .await
+            .expect("timed-out refresh must release the semaphore permit")
+            .expect("semaphore should remain open");
+    }
+
+    #[test]
+    fn live_usage_ttl_outlives_the_refresh_that_produces_it() {
+        // A live entry must not expire faster than the walk allowed to produce it,
+        // otherwise every admin poll on a large bucket misses and re-lists forever
+        // (rustfs/rustfs#4902). Guards against re-coupling the live TTL to the much
+        // shorter quota-cache TTL, or raising the refresh bound past the TTL.
+        assert!(
+            Duration::from_secs(LIVE_BUCKET_USAGE_TTL_SECS) >= LIVE_USAGE_REFRESH_TIMEOUT,
+            "live TTL ({LIVE_BUCKET_USAGE_TTL_SECS}s) must be >= the refresh bound ({LIVE_USAGE_REFRESH_TIMEOUT:?})"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delete_memory_and_backend_remove_invalidate_live_cache() {
+        const BUCKET: &str = "live-invalidate-on-delete-test";
+        clear_usage_memory_cache_for_test().await;
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 4,
+                size: 40,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("seed live cache");
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_some());
+
+        let persisted = data_usage_info_for_test(BUCKET, 4, 40, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory(BUCKET, 40, true).await;
+
+        assert!(
+            cached_live_bucket_usage_if_current(BUCKET).await.is_none(),
+            "delete-path memory updates must drop sticky live usage"
+        );
+
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 1,
+                size: 1,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("re-seed after delete memory invalidate");
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_some());
+
+        // remove_bucket_usage_from_backend also forgets live state before clearing memory.
+        forget_live_bucket_usage(BUCKET).await;
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_none());
+        assert!(
+            live_bucket_usage_epoch_if_tracked(BUCKET).await.is_none(),
+            "deleted buckets must drop epoch tracking to bound map growth"
+        );
+
+        clear_usage_memory_cache_for_test().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn apply_cached_live_restores_prior_counts_when_invalidate_races() {
+        const BUCKET: &str = "live-apply-delete-race-test";
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        *LIVE_APPLY_HIT_TEST_HOOK.lock().expect("hook lock") = None;
+
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 9,
+                size: 90,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("seed live cache");
+
+        let hook = Arc::new(LiveApplyHitTestHook {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *LIVE_APPLY_HIT_TEST_HOOK.lock().expect("hook lock") = Some(Arc::clone(&hook));
+
+        let mut response = data_usage_info_for_test(BUCKET, 5, 50, SystemTime::now());
+        let apply = tokio::spawn({
+            let mut response = response.clone();
+            async move {
+                apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, || async {
+                    Err(Error::other("scheduled refresh must not be required for restore assertion"))
+                })
+                .await;
+                response
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .expect("apply path must pause after a live cache hit");
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        hook.release.notify_one();
+
+        response = tokio::time::timeout(Duration::from_secs(2), apply)
+            .await
+            .expect("apply must finish after release")
+            .expect("apply task should not panic");
+        assert_eq!(
+            response
+                .buckets_usage
+                .get(BUCKET)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((5, 50)),
+            "invalidate during apply must restore scanner/overlay counts via the real apply helper"
+        );
+
+        *LIVE_APPLY_HIT_TEST_HOOK.lock().expect("hook lock") = None;
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forget_during_inflight_refresh_does_not_resurrect_epoch() {
+        const BUCKET: &str = "live-forget-no-epoch-resurrect-test";
+        forget_live_bucket_usage(BUCKET).await;
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut response = DataUsageInfo::default();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, {
+            let release = Arc::clone(&release);
+            let entered = Arc::clone(&entered);
+            move || {
+                let release = Arc::clone(&release);
+                let entered = Arc::clone(&entered);
+                async move {
+                    entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    release.notified().await;
+                    Ok(BucketUsageInfo {
+                        objects_count: 1,
+                        size: 10,
+                        ..Default::default()
+                    })
+                }
+            }
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("background refresh must enter init before forget");
+
+        forget_live_bucket_usage(BUCKET).await;
+        release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // Schedule task drops inflight in its finally block after coalesce returns.
+                // Poll until that happens and confirm forget did not leave a resurrected epoch.
+                if live_bucket_usage_cache().get(BUCKET).await.is_none()
+                    && live_bucket_usage_epoch_if_tracked(BUCKET).await.is_none()
+                    && !live_bucket_usage_in_flight().read().await.contains_key(BUCKET)
+                {
+                    // Give the schedule task a moment after forget cleared inflight early.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if live_bucket_usage_epoch_if_tracked(BUCKET).await.is_none()
+                        && live_bucket_usage_cache().get(BUCKET).await.is_none()
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("forget must leave no epoch tracking after the fenced refresh exits");
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_none());
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn apply_forget_during_hit_restore_does_not_schedule_or_resurrect_epoch() {
+        const BUCKET: &str = "live-apply-forget-no-resurrect-test";
+        forget_live_bucket_usage(BUCKET).await;
+        *LIVE_APPLY_HIT_TEST_HOOK.lock().expect("hook lock") = None;
+
+        ensure_live_bucket_usage_epoch(BUCKET).await;
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 9,
+                size: 90,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("seed live cache");
+
+        let hook = Arc::new(LiveApplyHitTestHook {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *LIVE_APPLY_HIT_TEST_HOOK.lock().expect("hook lock") = Some(Arc::clone(&hook));
+
+        let init_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut response = data_usage_info_for_test(BUCKET, 5, 50, SystemTime::now());
+        let apply = tokio::spawn({
+            let init_calls = Arc::clone(&init_calls);
+            let mut response = response.clone();
+            async move {
+                apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, move || {
+                    let init_calls = Arc::clone(&init_calls);
+                    async move {
+                        init_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(BucketUsageInfo {
+                            objects_count: 1,
+                            size: 1,
+                            ..Default::default()
+                        })
+                    }
+                })
+                .await;
+                response
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .expect("apply path must pause after a live cache hit");
+        forget_live_bucket_usage(BUCKET).await;
+        hook.release.notify_one();
+
+        response = tokio::time::timeout(Duration::from_secs(2), apply)
+            .await
+            .expect("apply must finish after release")
+            .expect("apply task should not panic");
+        assert_eq!(
+            response
+                .buckets_usage
+                .get(BUCKET)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((5, 50)),
+            "forget during apply must restore scanner/overlay counts"
+        );
+        assert_eq!(
+            init_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forget after apply hit must not schedule a refresh that runs init"
+        );
+        assert!(live_bucket_usage_epoch_if_tracked(BUCKET).await.is_none());
+        assert!(cached_live_bucket_usage_if_current(BUCKET).await.is_none());
+
+        *LIVE_APPLY_HIT_TEST_HOOK.lock().expect("hook lock") = None;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forget_between_still_owned_and_ensure_does_not_resurrect_epoch() {
+        const BUCKET: &str = "live-forget-pre-ensure-test";
+        forget_live_bucket_usage(BUCKET).await;
+        *LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK.lock().expect("hook lock") = None;
+
+        let hook = Arc::new(LiveSchedulePreEnsureTestHook {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK.lock().expect("hook lock") = Some(Arc::clone(&hook));
+
+        let init_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut response = DataUsageInfo::default();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, {
+            let init_calls = Arc::clone(&init_calls);
+            move || {
+                let init_calls = Arc::clone(&init_calls);
+                async move {
+                    init_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(BucketUsageInfo {
+                        objects_count: 1,
+                        size: 10,
+                        ..Default::default()
+                    })
+                }
+            }
+        })
+        .await;
+
+        // Pauses after the first still_owned check has already passed, so forget()
+        // below fences generation/in-flight *before* ensure resurrects epoch 0,
+        // reproducing the still_owned -> ensure -> still_owned TOCTOU (Bug 1).
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .expect("schedule must pause after still_owned check and before ensure");
+        forget_live_bucket_usage(BUCKET).await;
+        hook.release.notify_one();
+
+        // The fenced task's remaining work (ensure + second still_owned check + return) is
+        // pure in-memory bookkeeping with no further await-yielding I/O, so a bounded sleep
+        // deterministically lets it finish. A `contains_key`/`is_none` polling loop would be
+        // wrong here: the state right after `forget` above already satisfies "untracked", so
+        // it could pass trivially before the paused task ever resumes and resurrects it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            live_bucket_usage_epoch_if_tracked(BUCKET).await.is_none(),
+            "forget between still_owned and ensure must leave the epoch untracked"
+        );
+        assert!(
+            live_bucket_usage_cache().get(BUCKET).await.is_none(),
+            "forget between still_owned and ensure must not leave a TTL publish"
+        );
+        assert!(
+            !live_bucket_usage_in_flight().read().await.contains_key(BUCKET),
+            "fenced schedule must not leave a stale in-flight entry"
+        );
+        assert!(
+            cached_live_bucket_usage_if_current(BUCKET).await.is_none(),
+            "no usable TTL entry must survive the fenced ensure resurrection"
+        );
+        assert_eq!(
+            init_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "init must not run (or publish) once the post-ensure still_owned check fails"
+        );
+
+        *LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK.lock().expect("hook lock") = None;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn in_flight_owner_remove_does_not_clear_newer_schedule() {
+        const BUCKET: &str = "live-inflight-owner-token-test";
+        forget_live_bucket_usage(BUCKET).await;
+        *LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK.lock().expect("hook lock") = None;
+
+        let first_hook = Arc::new(LiveSchedulePreEnsureTestHook {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK.lock().expect("hook lock") = Some(Arc::clone(&first_hook));
+
+        let init_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let concurrent_inits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_concurrent_inits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut response = DataUsageInfo::default();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, {
+            let init_calls = Arc::clone(&init_calls);
+            let concurrent_inits = Arc::clone(&concurrent_inits);
+            let max_concurrent_inits = Arc::clone(&max_concurrent_inits);
+            move || {
+                let init_calls = Arc::clone(&init_calls);
+                let concurrent_inits = Arc::clone(&concurrent_inits);
+                let max_concurrent_inits = Arc::clone(&max_concurrent_inits);
+                async move {
+                    let now = concurrent_inits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_concurrent_inits.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    init_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    concurrent_inits.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(BucketUsageInfo {
+                        objects_count: 1,
+                        size: 1,
+                        ..Default::default()
+                    })
+                }
+            }
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(2), first_hook.entered.notified())
+            .await
+            .expect("first schedule must reach pre-ensure hook");
+
+        forget_live_bucket_usage(BUCKET).await;
+        *LIVE_SCHEDULE_PRE_ENSURE_TEST_HOOK.lock().expect("hook lock") = None;
+
+        let mut response = DataUsageInfo::default();
+        apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, {
+            let init_calls = Arc::clone(&init_calls);
+            let concurrent_inits = Arc::clone(&concurrent_inits);
+            let max_concurrent_inits = Arc::clone(&max_concurrent_inits);
+            move || {
+                let init_calls = Arc::clone(&init_calls);
+                let concurrent_inits = Arc::clone(&concurrent_inits);
+                let max_concurrent_inits = Arc::clone(&max_concurrent_inits);
+                async move {
+                    let now = concurrent_inits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_concurrent_inits.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    init_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    concurrent_inits.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(BucketUsageInfo {
+                        objects_count: 1,
+                        size: 1,
+                        ..Default::default()
+                    })
+                }
+            }
+        })
+        .await;
+
+        first_hook.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if init_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1
+                    && live_bucket_usage_in_flight().read().await.contains_key(BUCKET)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("second schedule must own in-flight after forget fenced the first");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if init_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1
+                    && !live_bucket_usage_in_flight().read().await.contains_key(BUCKET)
+                    && cached_live_bucket_usage_if_current(BUCKET).await.is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fenced first schedule must finish without clearing the second owner");
+
+        assert_eq!(
+            max_concurrent_inits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "old schedule finishing must not allow a third concurrent coalesce/init"
+        );
+        assert_eq!(init_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        forget_live_bucket_usage(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn discard_superseded_live_cache_entry_race_keeps_newer_winner() {
+        const BUCKET: &str = "live-discard-toctou-race-test";
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        *LIVE_DISCARD_TEST_HOOK.lock().expect("hook lock") = None;
+
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 2,
+                size: 20,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("seed live cache");
+        let stale_epoch = live_bucket_usage_epoch(BUCKET).await;
+
+        let hook = Arc::new(LiveDiscardTestHook {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *LIVE_DISCARD_TEST_HOOK.lock().expect("hook lock") = Some(Arc::clone(&hook));
+
+        // Pass the seeded (loser) entry's own epoch as the superseded epoch, matching how
+        // callers invoke discard: the removed cached entry's epoch equals the superseded
+        // epoch, so remove+conditional-reinsert must return without touching the newer
+        // winner published while discard was paused.
+        let discard = tokio::spawn(discard_superseded_live_cache_entry(BUCKET, stale_epoch));
+
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .expect("discard must pause after remove");
+
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+        coalesce_live_bucket_usage(BUCKET.to_string(), || async {
+            Ok(BucketUsageInfo {
+                objects_count: 3,
+                size: 30,
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("publish newer winner while discard is paused");
+
+        hook.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), discard)
+            .await
+            .expect("discard must finish")
+            .expect("discard task should not panic");
+
+        let winner = cached_live_bucket_usage_if_current(BUCKET)
+            .await
+            .expect("newer winner must survive discard TOCTOU race");
+        assert_eq!((winner.objects_count, winner.size), (3, 30));
+
+        *LIVE_DISCARD_TEST_HOOK.lock().expect("hook lock") = None;
+        invalidate_live_bucket_usage_cache(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_apply_cache_miss_schedules_single_in_flight_refresh() {
+        const BUCKET: &str = "live-schedule-inflight-dedupe-test";
+        forget_live_bucket_usage(BUCKET).await;
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let init_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let make_init = {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let init_calls = Arc::clone(&init_calls);
+                move || {
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    let init_calls = Arc::clone(&init_calls);
+                    async move {
+                        init_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        entered.notify_waiters();
+                        release.notified().await;
+                        Ok(BucketUsageInfo {
+                            objects_count: 4,
+                            size: 40,
+                            ..Default::default()
+                        })
+                    }
+                }
+            };
+            tasks.push(tokio::spawn(async move {
+                let mut response = DataUsageInfo::default();
+                apply_cached_live_bucket_usage_or_schedule_refresh(&mut response, BUCKET, make_init).await;
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("one scheduled refresh must enter init");
+        assert_eq!(
+            init_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "in-flight dedupe must allow only one background init for concurrent cache misses"
+        );
+        assert!(live_bucket_usage_in_flight().read().await.contains_key(BUCKET));
+
+        release.notify_waiters();
+        for task in tasks {
+            task.await.expect("concurrent apply task should not panic");
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cached_live_bucket_usage_if_current(BUCKET).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("single refresh should populate the TTL cache");
+        assert_eq!(init_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        forget_live_bucket_usage(BUCKET).await;
+    }
+
+    #[test]
+    fn apply_live_bucket_usage_to_multiple_buckets_then_calculate_totals_once() {
+        let mut response = DataUsageInfo::default();
+        apply_live_bucket_usage_to_response(
+            &mut response,
+            "bucket-a",
+            &BucketUsageInfo {
+                objects_count: 2,
+                versions_count: 2,
+                size: 20,
+                ..Default::default()
+            },
+        );
+        apply_live_bucket_usage_to_response(
+            &mut response,
+            "bucket-b",
+            &BucketUsageInfo {
+                objects_count: 3,
+                versions_count: 3,
+                size: 30,
+                ..Default::default()
+            },
+        );
+        // Per-bucket apply must not recompute aggregates (avoids O(n^2) on AccountInfo).
+        assert_eq!(response.objects_total_count, 0);
+        assert_eq!(response.objects_total_size, 0);
+
+        response.calculate_totals();
+
+        assert_eq!(response.buckets_count, 2);
+        assert_eq!(response.objects_total_count, 5);
+        assert_eq!(response.versions_total_count, 5);
+        assert_eq!(response.objects_total_size, 50);
     }
 
     #[tokio::test]

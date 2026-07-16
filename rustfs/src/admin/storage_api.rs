@@ -456,17 +456,17 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
 
-    pub(crate) async fn refresh_bucket_usage_from_object_layer(
+    pub(crate) async fn apply_cached_or_schedule_live_bucket_usage(
         store: Arc<crate::storage::storage_api::ECStore>,
         data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
         bucket_name: &str,
-    ) -> Result<rustfs_data_usage::BucketUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::refresh_bucket_usage_from_object_layer(
+    ) {
+        crate::storage::storage_api::ecstore_data_usage::apply_cached_or_schedule_live_bucket_usage(
             store,
             data_usage_info,
             bucket_name,
         )
-        .await
+        .await;
     }
 
     pub(crate) async fn load_data_usage_from_backend(

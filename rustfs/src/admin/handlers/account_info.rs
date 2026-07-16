@@ -19,7 +19,7 @@ use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::data_usage::{
-    apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
+    apply_bucket_usage_memory_overlay, apply_cached_or_schedule_live_bucket_usage, load_data_usage_from_backend,
     replace_bucket_usage_memory_from_info,
 };
 use crate::admin::storage_api::metadata_sys;
@@ -38,8 +38,6 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error}
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::debug;
-
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
@@ -264,7 +262,7 @@ impl Operation for AccountInfoHandler {
         for bucket in buckets.iter() {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
-                let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+                let bucket_info = rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
                     details: Some(rustfs_madmin::BucketDetails {
                         versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
@@ -277,18 +275,19 @@ impl Operation for AccountInfoHandler {
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
                     ..Default::default()
                 };
-                // AccountInfo backs Console bucket stats, so prefer object-layer usage over potentially cold scanner snapshots.
-                if let Err(err) = refresh_bucket_usage_from_object_layer(store.clone(), &mut data_usage_info, &bucket.name).await
-                {
-                    debug!(
-                        bucket = %bucket.name,
-                        error = %err,
-                        "failed to refresh account info bucket usage from object layer"
-                    );
-                }
-                apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
+                // Prefer a TTL-cached live recount when available; otherwise return
+                // scanner/overlay counts immediately and refresh in the background
+                // (rustfs/rustfs#4902).
+                apply_cached_or_schedule_live_bucket_usage(store.clone(), &mut data_usage_info, &bucket.name).await;
                 account_info.buckets.push(bucket_info);
             }
+        }
+        data_usage_info.calculate_totals();
+
+        // Dirty write-path counts must win over a TTL-cached live snapshot.
+        apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
+        for bucket_info in account_info.buckets.iter_mut() {
+            apply_usage_to_bucket_access_info(bucket_info, data_usage_info.buckets_usage.get(&bucket_info.name));
         }
 
         let data = serde_json::to_vec(&account_info)

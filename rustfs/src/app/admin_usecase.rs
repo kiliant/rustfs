@@ -21,7 +21,7 @@ use super::storage_api::admin_usecase::capacity::{
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations, BucketOptions};
 use super::storage_api::admin_usecase::data_usage::{
-    apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
+    apply_bucket_usage_memory_overlay, apply_cached_or_schedule_live_bucket_usage, load_data_usage_from_backend,
     replace_bucket_usage_memory_from_info,
 };
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
@@ -252,6 +252,8 @@ impl DefaultAdminUsecase {
         replace_bucket_usage_memory_from_info(&info).await;
         apply_bucket_usage_memory_overlay(&mut info).await;
         Self::refresh_live_bucket_usage_for_data_usage_info(store.clone(), &mut info).await;
+        // Dirty write-path counts must win over a TTL-cached live snapshot.
+        apply_bucket_usage_memory_overlay(&mut info).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
@@ -337,14 +339,11 @@ impl DefaultAdminUsecase {
         };
 
         for bucket in buckets {
-            if let Err(err) = refresh_bucket_usage_from_object_layer(store.clone(), data_usage_info, &bucket.name).await {
-                debug!(
-                    bucket = %bucket.name,
-                    error = %err,
-                    "failed to refresh data usage info bucket usage from object layer"
-                );
-            }
+            // Do not await a full object-version listing on the admin request path
+            // (rustfs/rustfs#4902); apply a TTL cache hit and schedule a background refresh.
+            apply_cached_or_schedule_live_bucket_usage(store.clone(), data_usage_info, &bucket.name).await;
         }
+        data_usage_info.calculate_totals();
     }
 
     pub async fn execute_list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>> {
