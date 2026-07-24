@@ -693,6 +693,33 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_addressing_style_parsing() {
+        use crate::config::AddressingStyle;
+
+        // Default when the flag is absent is `auto` (backward compatible).
+        let opt = Opt::parse_from(vec!["rustfs", "/data/vol1"]);
+        assert_eq!(opt.addressing_style, AddressingStyle::Auto);
+
+        // Canonical values.
+        let opt = Opt::parse_from(vec!["rustfs", "/data/vol1", "--addressing-style", "path"]);
+        assert_eq!(opt.addressing_style, AddressingStyle::Path);
+
+        let opt = Opt::parse_from(vec!["rustfs", "/data/vol1", "--addressing-style", "virtual-hosted"]);
+        assert_eq!(opt.addressing_style, AddressingStyle::VirtualHosted);
+
+        // A few accepted aliases.
+        let opt = Opt::parse_from(vec!["rustfs", "/data/vol1", "--addressing-style", "vhost"]);
+        assert_eq!(opt.addressing_style, AddressingStyle::VirtualHosted);
+
+        let opt = Opt::parse_from(vec!["rustfs", "/data/vol1", "--addressing-style", "path-style"]);
+        assert_eq!(opt.addressing_style, AddressingStyle::Path);
+
+        // Unknown values are rejected by the parser.
+        assert!(Opt::try_parse_from(vec!["rustfs", "/data/vol1", "--addressing-style", "bogus"]).is_err());
+    }
+
+    #[test]
+    #[serial]
     fn test_access_key_arguments_mutually_exclusive_cli() {
         // Test that CLI args configuration fails on conflict
         let args = vec![

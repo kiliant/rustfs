@@ -17,6 +17,7 @@ use crate::admin;
 use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
+use crate::config::AddressingStyle;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
@@ -393,6 +394,53 @@ fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, s
     }
 }
 
+/// Decide whether virtual-hosted-style routing is active for the given
+/// [`AddressingStyle`] and runtime preconditions.
+///
+/// `is_console_listener` distinguishes the two listeners this function serves:
+/// `s3_http_server_config` always clears `console_enable` for the S3 listener,
+/// while `console_http_server_config` keeps it set for the console listener, so
+/// inside the server the flag means "this listener serves the console UI", not
+/// "the console feature is enabled". The console listener never routes bucket
+/// traffic, so it is always path-style regardless of the configured style.
+///
+/// For the S3 listener:
+/// - `Auto` reproduces the historical behavior: virtual-hosted exactly when
+///   server domains are configured.
+/// - `Path` always resolves to path-style, ignoring any configured domains.
+/// - `VirtualHosted` requires configured server domains; otherwise it returns an
+///   error so a missing or misspelled `RUSTFS_SERVER_DOMAINS` fails fast instead
+///   of silently downgrading to path-style.
+///
+/// Returned as `Result<bool, String>` (the caller maps the message onto the
+/// server error type) to keep the decision pure and trivially unit-testable.
+fn resolve_virtual_host_routing(
+    style: AddressingStyle,
+    server_domains_empty: bool,
+    is_console_listener: bool,
+) -> std::result::Result<bool, String> {
+    // The console listener serves the console UI on its own address; bucket
+    // subdomain routing never applies there.
+    if is_console_listener {
+        return Ok(false);
+    }
+
+    match style {
+        AddressingStyle::Auto => Ok(!server_domains_empty),
+        AddressingStyle::Path => Ok(false),
+        AddressingStyle::VirtualHosted => {
+            if server_domains_empty {
+                Err(
+                    "RUSTFS_ADDRESSING_STYLE=virtual-hosted requires at least one server domain; set RUSTFS_SERVER_DOMAINS"
+                        .to_string(),
+                )
+            } else {
+                Ok(true)
+            }
+        }
+    }
+}
+
 pub async fn start_http_server(
     config: &config::Config,
     readiness: Arc<GlobalReadiness>,
@@ -661,9 +709,32 @@ pub async fn start_http_server(
         );
     }
 
+    // Resolve whether virtual-hosted-style routing is active from the explicit
+    // `--addressing-style` toggle. `auto` preserves the historical inference
+    // (virtual-hosted exactly when server domains are configured, and never on
+    // the console listener); `virtual-hosted` fails fast when server domains are
+    // missing rather than silently downgrading to path-style.
+    let use_virtual_host_routing =
+        resolve_virtual_host_routing(config.addressing_style, config.server_domains.is_empty(), config.console_enable)
+            .map_err(Error::other)?;
+
+    // `path` deliberately overrides configured domains; say so once on the S3
+    // listener so the effective style is never silently different from what the
+    // operator configured.
+    if config.addressing_style == AddressingStyle::Path && !config.server_domains.is_empty() && !config.console_enable {
+        warn!(
+            event = EVENT_HTTP_HOST_ROUTING,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            state = "disabled",
+            reason = "addressing_style_path",
+            "RUSTFS_ADDRESSING_STYLE=path forces path-style; configured server domains are ignored for routing"
+        );
+    }
+
     // Expanded virtual-hosted-style domain set (with port variants); shared by
     // the s3s host router below and the rate limit layer's bucket extraction.
-    let host_domain_sets = if !config.server_domains.is_empty() && !config.console_enable {
+    let host_domain_sets = if use_virtual_host_routing {
         MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
 
         // add the default port number to the given server domains
@@ -2007,6 +2078,66 @@ mod tests {
     use storage::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
     use storage::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use tower::{Layer, Service, ServiceBuilder};
+
+    mod addressing_style {
+        use super::super::{AddressingStyle, resolve_virtual_host_routing};
+
+        // Argument names below mirror the resolver: (style, domains_empty,
+        // is_console_listener). `s3_http_server_config` always clears
+        // `console_enable` for the S3 listener, so `is_console_listener` is
+        // false there and true only for the console listener.
+        const S3: bool = false;
+        const CONSOLE: bool = true;
+
+        // `Auto` must reproduce the historical inference exactly. The legacy
+        // condition was `!domains_empty && !console_enable`, which on the S3
+        // listener (console_enable always false) reduces to `!domains_empty`.
+        #[test]
+        fn auto_matches_legacy_inference() {
+            assert!(!resolve_virtual_host_routing(AddressingStyle::Auto, true, S3).unwrap());
+            assert!(resolve_virtual_host_routing(AddressingStyle::Auto, false, S3).unwrap());
+            // Console listener is never virtual-hosted, matching the legacy guard.
+            assert!(!resolve_virtual_host_routing(AddressingStyle::Auto, true, CONSOLE).unwrap());
+            assert!(!resolve_virtual_host_routing(AddressingStyle::Auto, false, CONSOLE).unwrap());
+        }
+
+        // `Path` is unconditionally path-style.
+        #[test]
+        fn path_is_always_path_style() {
+            for domains_empty in [true, false] {
+                for is_console in [S3, CONSOLE] {
+                    assert!(!resolve_virtual_host_routing(AddressingStyle::Path, domains_empty, is_console).unwrap());
+                }
+            }
+        }
+
+        #[test]
+        fn virtual_hosted_enables_routing_on_s3_listener_with_domains() {
+            assert!(resolve_virtual_host_routing(AddressingStyle::VirtualHosted, false, S3).unwrap());
+        }
+
+        #[test]
+        fn virtual_hosted_without_domains_is_error() {
+            let err = resolve_virtual_host_routing(AddressingStyle::VirtualHosted, true, S3).unwrap_err();
+            assert!(err.contains("RUSTFS_SERVER_DOMAINS"), "unexpected message: {err}");
+        }
+
+        // Regression: the console listener must never abort startup. The console
+        // is enabled by default, so returning Err here would make
+        // `RUSTFS_ADDRESSING_STYLE=virtual-hosted` refuse to boot the server even
+        // though the S3 listener routes virtual-hosted requests correctly.
+        #[test]
+        fn virtual_hosted_on_console_listener_is_path_style_not_error() {
+            assert!(!resolve_virtual_host_routing(AddressingStyle::VirtualHosted, false, CONSOLE).unwrap());
+            // Missing domains must not turn into a startup failure here either.
+            assert!(!resolve_virtual_host_routing(AddressingStyle::VirtualHosted, true, CONSOLE).unwrap());
+        }
+
+        #[test]
+        fn default_style_is_auto() {
+            assert_eq!(AddressingStyle::default(), AddressingStyle::Auto);
+        }
+    }
 
     /// Baseline constants — reference the authoritative config defaults.
     /// If a config default changes, tests automatically follow.

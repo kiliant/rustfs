@@ -18,6 +18,7 @@
 //! after processing command line arguments, environment variables, and files.
 
 use super::Opt;
+use super::cli::AddressingStyle;
 use crate::apply_external_env_compat;
 use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_SECRET_KEY, RUSTFS_REGION,
@@ -92,6 +93,9 @@ pub struct Config {
     /// Domain name used for virtual-hosted-style requests.
     pub server_domains: Vec<String>,
 
+    /// Bucket addressing style for incoming S3 requests.
+    pub addressing_style: AddressingStyle,
+
     /// Access key used for authentication.
     pub access_key: String,
 
@@ -160,6 +164,7 @@ impl Config {
             volumes,
             address: address.into(),
             server_domains: Vec::new(),
+            addressing_style: AddressingStyle::default(),
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             console_enable: DEFAULT_CONSOLE_ENABLE,
@@ -192,6 +197,7 @@ impl Config {
             volumes,
             address,
             server_domains,
+            addressing_style,
             access_key,
             access_key_file,
             secret_key,
@@ -237,6 +243,7 @@ impl Config {
             volumes,
             address,
             server_domains,
+            addressing_style,
             access_key,
             secret_key,
             console_enable,
@@ -280,6 +287,7 @@ impl std::fmt::Debug for Config {
             .field("volumes", &self.volumes)
             .field("address", &self.address)
             .field("server_domains", &self.server_domains)
+            .field("addressing_style", &self.addressing_style)
             .field("access_key", &self.access_key)
             .field("secret_key", &Masked(Some(&self.secret_key))) // Hide sensitive values
             .field("console_enable", &self.console_enable)

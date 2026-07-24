@@ -184,6 +184,37 @@ pub enum InfoType {
     Deps,
 }
 
+/// Bucket addressing style for incoming S3 requests.
+///
+/// Controls whether the bucket is taken from the request path (`host/bucket`,
+/// path-style) or from the `Host` header subdomain (`bucket.host`,
+/// virtual-hosted-style).
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AddressingStyle {
+    /// Infer the style from configuration (backward-compatible default):
+    /// virtual-hosted when `--server-domains` is set, otherwise path-style.
+    #[default]
+    Auto,
+    /// Always use path-style addressing (`host/bucket`). Any configured server
+    /// domains are ignored for routing.
+    #[value(alias = "path-style")]
+    Path,
+    /// Always use virtual-hosted-style addressing (`bucket.host`). Requires
+    /// `--server-domains`; otherwise startup fails.
+    #[value(alias = "virtual", alias = "vhost", alias = "virtual-host")]
+    VirtualHosted,
+}
+
+impl std::fmt::Display for AddressingStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AddressingStyle::Auto => "auto",
+            AddressingStyle::Path => "path",
+            AddressingStyle::VirtualHosted => "virtual-hosted",
+        })
+    }
+}
+
 /// Info subcommand options
 #[derive(Args, Clone)]
 pub struct InfoOpts {
@@ -256,6 +287,22 @@ pub struct ServerOpts {
         value_parser = NonEmptyStringValueParser::new()
     )]
     pub server_domains: Vec<String>,
+
+    /// Bucket addressing style for incoming S3 requests: `auto` (default),
+    /// `path`, or `virtual-hosted`.
+    ///
+    /// `auto` preserves the historical behavior (virtual-hosted when
+    /// `--server-domains` is set, else path-style). `path` forces path-style and
+    /// ignores any configured server domains for routing. `virtual-hosted`
+    /// requires `--server-domains`, so a missing or misspelled value fails at
+    /// startup instead of silently falling back to path-style.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AddressingStyle::default(),
+        env = "RUSTFS_ADDRESSING_STYLE"
+    )]
+    pub addressing_style: AddressingStyle,
 
     /// Access key used for authentication.
     #[arg(long, env = "RUSTFS_ACCESS_KEY", group = "access-key")]
@@ -381,6 +428,7 @@ pub fn default_server_opts() -> ServerOpts {
             .collect(),
         address: DEFAULT_ADDRESS.to_string(),
         server_domains: vec![],
+        addressing_style: AddressingStyle::default(),
         access_key: None,
         access_key_file: None,
         secret_key: None,

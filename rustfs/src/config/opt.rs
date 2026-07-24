@@ -18,7 +18,7 @@
 //! and methods for parsing command line arguments.
 
 use super::Config;
-use super::cli::{Cli, CommandResult, Commands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
+use super::cli::{AddressingStyle, Cli, CommandResult, Commands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
 use crate::apply_external_env_compat;
 use CommandResult::Server;
 use clap::Parser;
@@ -31,6 +31,7 @@ pub struct Opt {
     pub volumes: Vec<String>,
     pub address: String,
     pub server_domains: Vec<String>,
+    pub addressing_style: AddressingStyle,
     pub access_key: Option<String>,
     pub access_key_file: Option<PathBuf>,
     pub secret_key: Option<String>,
@@ -61,6 +62,7 @@ impl Opt {
             volumes: o.volumes,
             address: o.address,
             server_domains: o.server_domains,
+            addressing_style: o.addressing_style,
             access_key: o.access_key,
             access_key_file: o.access_key_file,
             secret_key: o.secret_key,
